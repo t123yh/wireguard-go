@@ -11,6 +11,7 @@ endif
 endif
 
 export GOPATH ?= $(CURDIR)/.gopath
+export GOFLAGS ?= -ldflags=-s -ldflags=-w -gcflags=all=-trimpath=$(PWD) -asmflags=all=-trimpath=$(PWD) -buildmode=pie
 
 all: wireguard-go
 
