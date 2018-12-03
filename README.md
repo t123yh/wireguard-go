@@ -36,7 +36,7 @@ This runs on macOS using the utun driver. It does not yet support sticky sockets
 
 ### Windows
 
-It is currently a work in progress to strip out the beginnings of an experiment done with the OpenVPN tuntap driver and instead port to the new UWP APIs for tunnels. In other words, this does not *yet* work on Windows.
+It is currently a work in progress to strip out the beginnings of an experiment done with the OpenVPN tuntap driver and instead port to the new UWP APIs for tunnels. In other words, this does not *yet* work on Windows. It does not yet support sticky sockets, and won't support fwmarks because of Windows limitations.
 
 ### FreeBSD
 

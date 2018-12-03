@@ -1,6 +1,3 @@
-// +build !linux android
-// +build !windows
-
 /* SPDX-License-Identifier: GPL-2.0
  *
  * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
@@ -9,11 +6,11 @@
 package main
 
 import (
-	"golang.org/x/sys/unix"
 	"net"
 	"os"
-	"runtime"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 /* This code is meant to be a temporary solution
@@ -173,20 +170,9 @@ func (bind *NativeBind) Send(buff []byte, endpoint Endpoint) error {
 	return err
 }
 
-var fwmarkIoctl int
-
-func init() {
-	switch runtime.GOOS {
-	case "linux", "android":
-		fwmarkIoctl = 36 /* unix.SO_MARK */
-	case "freebsd":
-		fwmarkIoctl = 0x1015 /* unix.SO_USER_COOKIE */
-	case "openbsd":
-		fwmarkIoctl = 0x1021 /* unix.SO_RTABLE */
-	}
-}
-
 func (bind *NativeBind) SetMark(mark uint32) error {
+	return nil;
+	/*
 	if fwmarkIoctl == 0 {
 		return nil
 	}
@@ -196,7 +182,7 @@ func (bind *NativeBind) SetMark(mark uint32) error {
 			return err
 		}
 		err = fd.Control(func(fd uintptr) {
-			err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
+			err = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, fwmarkIoctl, int(mark))
 		})
 		if err != nil {
 			return err
@@ -208,11 +194,12 @@ func (bind *NativeBind) SetMark(mark uint32) error {
 			return err
 		}
 		err = fd.Control(func(fd uintptr) {
-			err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
+			err = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, fwmarkIoctl, int(mark))
 		})
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+	*/
 }
