@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -26,13 +27,13 @@ type QueueHandshakeElement struct {
 }
 
 type QueueInboundElement struct {
-	dropped  int32
-	mutex    sync.Mutex
-	buffer   *[MaxMessageSize]byte
-	packet   []byte
-	counter  uint64
-	keypair  *Keypair
-	endpoint Endpoint
+	dropped          int32
+	mutex            sync.Mutex
+	buffer           *[MaxMessageSize]byte
+	decryptedContent []byte
+	counter          uint64
+	keypair          *Keypair
+	endpoint         Endpoint
 }
 
 func (elem *QueueInboundElement) Drop() {
@@ -50,12 +51,25 @@ func (device *Device) addToInboundAndDecryptionQueues(inboundQueue chan *QueueIn
 		case decryptionQueue <- element:
 			return true
 		default:
+			fmt.Println("RecvInbound: Dropping packet because queue is full")
 			element.Drop()
 			element.mutex.Unlock()
 			return false
 		}
 	default:
+		fmt.Println("RecvInbound: Dropping packet because queue is full")
 		device.PutInboundElement(element)
+		return false
+	}
+}
+
+func (device *Device) addToSequentialQueue(inboundQueue chan *QueueInboundElement, element *QueueInboundElement) bool {
+	select {
+	case inboundQueue <- element:
+		return true
+	default:
+		fmt.Println("RecvSeq: Dropping packet because queue is full")
+		element.Drop()
 		return false
 	}
 }
@@ -170,8 +184,9 @@ func (device *Device) RoutineReceiveIncoming(IP int, bind Bind) {
 
 			// create work element
 			peer := value.peer
+			atomic.AddUint64(&peer.stats.rxPackets, 1)
 			elem := device.GetInboundElement()
-			elem.packet = packet
+			elem.decryptedContent = packet
 			elem.buffer = buffer
 			elem.keypair = keypair
 			elem.dropped = AtomicFalse
@@ -183,7 +198,7 @@ func (device *Device) RoutineReceiveIncoming(IP int, bind Bind) {
 			// add to decryption queues
 
 			if peer.isRunning.Get() {
-				if device.addToInboundAndDecryptionQueues(peer.queue.inbound, device.queue.decryption, elem) {
+				if device.addToInboundAndDecryptionQueues(peer.queue.inboundFEC, device.queue.decryption, elem) {
 					buffer = device.GetMessageBuffer()
 				}
 			}
@@ -252,8 +267,8 @@ func (device *Device) RoutineDecryption() {
 
 			// split message into fields
 
-			counter := elem.packet[MessageTransportOffsetCounter:MessageTransportOffsetContent]
-			content := elem.packet[MessageTransportOffsetContent:]
+			counter := elem.decryptedContent[MessageTransportOffsetCounter:MessageTransportOffsetContent]
+			content := elem.decryptedContent[MessageTransportOffsetContent:]
 
 			// expand nonce
 
@@ -271,7 +286,7 @@ func (device *Device) RoutineDecryption() {
 
 			var err error
 			elem.counter = binary.LittleEndian.Uint64(counter)
-			elem.packet, err = elem.keypair.receive.Open(
+			elem.decryptedContent, err = elem.keypair.receive.Open(
 				content[:0],
 				nonce[:],
 				content,
@@ -280,6 +295,8 @@ func (device *Device) RoutineDecryption() {
 			if err != nil {
 				elem.Drop()
 				device.PutMessageBuffer(elem.buffer)
+			} else {
+				logDebug.Printf("Opened length: %d", len(elem.decryptedContent))
 			}
 			elem.mutex.Unlock()
 		}
@@ -527,11 +544,138 @@ func (peer *Peer) RoutineSequentialReceiver() {
 				return
 			}
 
+			if elem.IsDropped() {
+				continue
+			}
+
+			packet := elem.decryptedContent[MessageMetadataSize:]
+
+			// verify source and strip padding
+
+			switch packet[0] >> 4 {
+			case ipv4.Version:
+
+				// strip padding
+
+				if len(packet) < ipv4.HeaderLen {
+					continue
+				}
+
+				field := packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
+				length := binary.BigEndian.Uint16(field)
+				if int(length) > len(packet) || int(length) < ipv4.HeaderLen {
+					continue
+				}
+
+				packet = packet[:length]
+
+				// verify IPv4 source
+
+				src := packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
+				if device.allowedips.LookupIPv4(src) != peer {
+					logInfo.Println(
+						"IPv4 packet with disallowed source address from",
+						peer,
+					)
+					continue
+				}
+
+			case ipv6.Version:
+
+				// strip padding
+
+				if len(packet) < ipv6.HeaderLen {
+					continue
+				}
+
+				field := packet[IPv6offsetPayloadLength : IPv6offsetPayloadLength+2]
+				length := binary.BigEndian.Uint16(field)
+				length += ipv6.HeaderLen
+				if int(length) > len(packet) {
+					continue
+				}
+
+				packet = packet[:length]
+
+				// verify IPv6 source
+
+				src := packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
+				if device.allowedips.LookupIPv6(src) != peer {
+					logInfo.Println(
+						peer,
+						"sent packet with disallowed IPv6 source",
+					)
+					continue
+				}
+
+			default:
+				logInfo.Println("Packet with invalid IP version from", peer)
+				continue
+			}
+
+			// write to tun device
+
+			offset := MessageTransportOffsetContent + MessageMetadataSize
+			atomic.AddUint64(&peer.stats.rxBytes, uint64(len(packet)))
+			atomic.AddUint64(&peer.stats.rxDelivered, 1)
+			_, err := device.tun.device.Write(elem.buffer[:offset+len(packet)], offset)
+			if err != nil {
+				logError.Println("Failed to write packet to TUN device:", err)
+			}
+		}
+	}
+}
+
+func (peer *Peer) RoutineInboundFEC() {
+
+	device := peer.device
+	logDebug := device.log.Debug
+	logInfo := device.log.Info
+
+	var elem *QueueInboundElement
+	var ok bool
+
+	defer func() {
+		logDebug.Println(peer, "- Routine: inbound FEC - stopped")
+		peer.routines.stopping.Done()
+		if elem != nil {
+			if !elem.IsDropped() {
+				device.PutMessageBuffer(elem.buffer)
+			}
+			device.PutInboundElement(elem)
+		}
+	}()
+
+	logDebug.Println(peer, "- Routine: inbound FEC - started")
+
+	peer.routines.starting.Done()
+
+	for {
+		if elem != nil {
+			if !elem.IsDropped() {
+				device.PutMessageBuffer(elem.buffer)
+			}
+			device.PutInboundElement(elem)
+			elem = nil
+		}
+
+		select {
+
+		case <-peer.routines.stop:
+			return
+
+		case elem, ok = <-peer.queue.inboundFEC:
+
+			if !ok {
+				return
+			}
+
 			// wait for decryption
 
 			elem.mutex.Lock()
 
 			if elem.IsDropped() {
+				logDebug.Println("FEC inbound: dropped: ", elem.counter)
 				continue
 			}
 
@@ -559,83 +703,163 @@ func (peer *Peer) RoutineSequentialReceiver() {
 
 			// check for keepalive
 
-			if len(elem.packet) == 0 {
+			if len(elem.decryptedContent) == 0 {
 				logDebug.Println(peer, "- Receiving keepalive packet")
 				continue
 			}
 			peer.timersDataReceived()
 
-			// verify source and strip padding
+			// do fec processing job
 
-			switch elem.packet[0] >> 4 {
-			case ipv4.Version:
+			// TODO: make sure packetPos is not out of bound
+			packetPos := elem.decryptedContent[0]
 
-				// strip padding
+			logDebug.Println("FEC inbound: processing: ", elem.counter, ", packetPos = ", packetPos)
 
-				if len(elem.packet) < ipv4.HeaderLen {
+			packetGroupId := binary.LittleEndian.Uint16(elem.decryptedContent[1:3])
+			actualData := elem.decryptedContent[MessageMetadataSize:]
+			// bufferId := packetGroupId % ReceiveFECWindowSize
+			currentBuffer := &peer.recvBuffers[packetGroupId%ReceiveFECWindowSize]
+
+			logDebug.Printf("currentBuffer.groupId is %d, packetGroupId is %d", currentBuffer.groupId, packetGroupId)
+			// Make sure the current group is the group we want
+			// (we might be receiving N - 16 or N + 16)
+			if currentBuffer.groupId != packetGroupId {
+				logDebug.Printf("elem.counter is %d, minimumCounter is %d", elem.counter, currentBuffer.minimumCounter)
+				if elem.counter > currentBuffer.minimumCounter {
+					x1 := 0
+					for i := 0; i < peer.recvDataShards; i++ {
+						if !currentBuffer.delivered[i] {
+							x1++
+						}
+					}
+					if x1 > 0 {
+						x2 := 0
+						for i := 0; i < peer.recvDataShards+peer.recvParityShards; i++ {
+							if len(currentBuffer.buffers[i]) == 0 {
+								x2++
+							}
+						}
+						logInfo.Printf("%d undelivered (total unreceived = %d), groupId = %d", x1, x2, currentBuffer.groupId)
+					}
+					// the packet is newer
+					currentBuffer.reset()
+					logDebug.Printf("Resetting buffer")
+				} else {
+					// the packet is older (maybe Group N-16), just ignore the packet
+					if packetPos < uint8(peer.recvDataShards) {
+						logDebug.Println("FEC inbound: add to sequential queue (old): ", elem.counter)
+						device.addToSequentialQueue(peer.queue.inbound, elem)
+						elem = nil
+					} else {
+						elem.Drop()
+					}
 					continue
 				}
+				currentBuffer.groupId = packetGroupId
+			}
 
-				field := elem.packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
-				length := binary.BigEndian.Uint16(field)
-				if int(length) > len(elem.packet) || int(length) < ipv4.HeaderLen {
-					continue
-				}
-
-				elem.packet = elem.packet[:length]
-
-				// verify IPv4 source
-
-				src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
-				if device.allowedips.LookupIPv4(src) != peer {
-					logInfo.Println(
-						"IPv4 packet with disallowed source address from",
-						peer,
-					)
-					continue
-				}
-
-			case ipv6.Version:
-
-				// strip padding
-
-				if len(elem.packet) < ipv6.HeaderLen {
-					continue
-				}
-
-				field := elem.packet[IPv6offsetPayloadLength : IPv6offsetPayloadLength+2]
-				length := binary.BigEndian.Uint16(field)
-				length += ipv6.HeaderLen
-				if int(length) > len(elem.packet) {
-					continue
-				}
-
-				elem.packet = elem.packet[:length]
-
-				// verify IPv6 source
-
-				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
-				if device.allowedips.LookupIPv6(src) != peer {
-					logInfo.Println(
-						peer,
-						"sent packet with disallowed IPv6 source",
-					)
-					continue
-				}
-
-			default:
-				logInfo.Println("Packet with invalid IP version from", peer)
+			if currentBuffer.recovered {
+				logDebug.Println("Skipping already recovered packet")
+				// the packet group has already been fec'ed
+				elem.Drop()
 				continue
 			}
 
-			// write to tun device
+			currentBuffer.buffers[packetPos] = currentBuffer.buffers[packetPos][:len(actualData)]
+			// TODO: Detect if the buffer here is really unused.
+			copy(currentBuffer.buffers[packetPos], actualData)
 
-			offset := MessageTransportOffsetContent
-			atomic.AddUint64(&peer.stats.rxBytes, uint64(len(elem.packet)))
-			_, err := device.tun.device.Write(elem.buffer[:offset+len(elem.packet)], offset)
-			if err != nil {
-				logError.Println("Failed to write packet to TUN device:", err)
+			if currentBuffer.minimumCounter == 0 {
+				currentBuffer.minimumCounter = elem.counter
+			} else {
+				currentBuffer.minimumCounter = min64(elem.counter, currentBuffer.minimumCounter)
 			}
+
+			if packetPos < uint8(peer.recvDataShards) {
+				// is a data shard
+				currentBuffer.delivered[packetPos] = true
+				logDebug.Println("FEC inbound: add to sequential queue: ", elem.counter)
+				device.addToSequentialQueue(peer.queue.inbound, elem)
+				elem = nil
+			} else {
+				// is a parity shard, shouldn't be processed later
+				elem.Drop()
+			}
+
+			deliveredCount := 0
+			receivedCount := 0
+			for i := 0; i < peer.recvDataShards; i++ {
+				if currentBuffer.delivered[i] {
+					deliveredCount++
+				}
+			}
+
+			for i := 0; i < len(currentBuffer.buffers); i++ {
+				if len(currentBuffer.buffers[i]) != 0 {
+					receivedCount++
+				}
+			}
+
+			if deliveredCount != peer.recvDataShards && receivedCount >= peer.recvDataShards {
+				// Time to do FEC
+				blockSize := 0
+				for i := peer.recvDataShards; i < peer.recvDataShards+peer.recvParityShards; i++ {
+					if len(currentBuffer.buffers[i]) != 0 {
+						blockSize = len(currentBuffer.buffers[i])
+					}
+				}
+
+				var err error
+				x := 0
+				if blockSize == 0 {
+					goto fail
+				}
+
+				for i := 0; i < len(currentBuffer.buffers); i++ {
+					if len(currentBuffer.buffers[i]) != 0 {
+						logDebug.Printf("ReceivedCount = %d, delivered = %d, Correct [%d] First byte is %d", receivedCount, deliveredCount, i, currentBuffer.buffers[i][0])
+						originalLen := len(currentBuffer.buffers[i])
+						if originalLen != blockSize {
+							currentBuffer.buffers[i] = currentBuffer.buffers[i][:blockSize]
+							for j := originalLen; j < blockSize; j++ {
+								currentBuffer.buffers[i][j] = 0
+							}
+						}
+					}
+				}
+
+				err = peer.recvEncoder.ReconstructData(currentBuffer.buffers)
+				if err != nil {
+					logInfo.Println("Recover fail", err)
+					goto fail
+				}
+
+				for i := 0; i < peer.recvDataShards; i++ {
+					if !currentBuffer.delivered[i] {
+						x++
+
+						recoveredElem := device.GetInboundElement()
+						recoveredElem.buffer = device.GetMessageBuffer()
+						recoveredElem.decryptedContent = recoveredElem.buffer[MessageTransportOffsetContent:]
+						binary.LittleEndian.PutUint16(recoveredElem.decryptedContent[1:3], packetGroupId)
+						recoveredElem.decryptedContent[0] = uint8(i)
+						copy(recoveredElem.decryptedContent[MessageMetadataSize:], currentBuffer.buffers[i])
+						recoveredElem.dropped = AtomicFalse
+						if !device.addToSequentialQueue(peer.queue.inbound, recoveredElem) {
+							device.PutMessageBuffer(recoveredElem.buffer)
+							device.PutInboundElement(recoveredElem)
+						}
+					}
+					currentBuffer.delivered[i] = true
+				}
+				// logInfo.Printf("Recovered %d lost packet", x)
+
+				currentBuffer.recovered = true
+			fail:
+			}
+
+			continue
 		}
 	}
 }

@@ -9,13 +9,35 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/klauspost/reedsolomon"
 	"sync"
 	"time"
 )
 
 const (
-	PeerRoutineNumber = 3
+	PeerRoutineNumber    = 5
+	ReceiveFECWindowSize = 16
 )
+
+type RecvBuffer struct {
+	groupId        uint16
+	minimumCounter uint64
+	recovered      bool
+	delivered      []bool
+	buffers        [][]byte
+}
+
+func (buf *RecvBuffer) reset() {
+	buf.minimumCounter = 0
+	buf.groupId = 0
+	buf.recovered = false
+	for i := 0; i < len(buf.delivered); i++ {
+		buf.delivered[i] = false
+	}
+	for i := 0; i < len(buf.buffers); i++ {
+		buf.buffers[i] = buf.buffers[i][:0]
+	}
+}
 
 type Peer struct {
 	isRunning                   AtomicBool
@@ -26,11 +48,30 @@ type Peer struct {
 	endpoint                    Endpoint
 	persistentKeepaliveInterval uint16
 
+	// TODO: The shard count is fixed at 10/3 for testing.
+	sendDataShards   int
+	sendParityShards int
+	sendEncoder      reedsolomon.Encoder
+	sendGroupId      uint16
+	sendGroupPos     uint8
+	sendGroup        [][]byte
+
+	recvDataShards   int
+	recvParityShards int
+	recvEncoder      reedsolomon.Encoder
+	recvBuffers      [ReceiveFECWindowSize]RecvBuffer
+
 	// This must be 64-bit aligned, so make sure the above members come out to even alignment and pad accordingly
 	stats struct {
-		txBytes           uint64 // bytes send to peer (endpoint)
-		rxBytes           uint64 // bytes received from peer
-		lastHandshakeNano int64  // nano seconds since epoch
+		txBytes uint64 // bytes send to peer (endpoint)
+		rxBytes uint64 // bytes received from peer
+
+		rxDelivered uint64
+		rxPackets   uint64
+		txPackets   uint64
+		txDelivered uint64
+
+		lastHandshakeNano int64 // nano seconds since epoch
 	}
 
 	timers struct {
@@ -50,9 +91,11 @@ type Peer struct {
 	}
 
 	queue struct {
+		outboundFEC                     chan *QueueOutboundElement // outbound fec queue
 		nonce                           chan *QueueOutboundElement // nonce / pre-handshake queue
 		outbound                        chan *QueueOutboundElement // sequential ordering of work
 		inbound                         chan *QueueInboundElement  // sequential ordering of work
+		inboundFEC                      chan *QueueInboundElement  // inbound fec queue
 		packetInNonceQueueIsAwaitingKey AtomicBool
 	}
 
@@ -111,6 +154,46 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	handshake.remoteStatic = pk
 	handshake.precomputedStaticStatic = device.staticIdentity.privateKey.sharedSecret(pk)
 	handshake.mutex.Unlock()
+
+	// initialize RS Encoder
+
+	peer.sendDataShards = 10
+	peer.recvDataShards = 10
+	peer.sendParityShards = 3
+	peer.recvParityShards = 3
+	var err error
+
+	peer.sendEncoder, err = reedsolomon.New(int(peer.sendDataShards), int(peer.sendParityShards), reedsolomon.WithMaxGoroutines(1))
+	if err != nil {
+		return nil, err
+	}
+	peer.recvEncoder, err = reedsolomon.New(int(peer.recvDataShards), int(peer.recvParityShards), reedsolomon.WithMaxGoroutines(1))
+	if err != nil {
+		return nil, err
+	}
+
+	peer.sendGroupId = 0
+	peer.sendGroupPos = 0
+	totalSendShards := peer.sendDataShards + peer.sendParityShards
+	peer.sendGroup = make([][]byte, totalSendShards)
+	for i := 0; i < totalSendShards; i++ {
+		peer.sendGroup[i] = make([]byte, 0, MaxMessageSize)
+	}
+
+	// TODO: clear receive buffer after re-negotiation
+	for i := 0; i < ReceiveFECWindowSize; i++ {
+		peer.recvBuffers[i] = RecvBuffer{}
+		totalRecvShards := peer.recvDataShards + peer.recvParityShards
+		peer.recvBuffers[i].buffers = make([][]uint8, totalRecvShards)
+		peer.recvBuffers[i].delivered = make([]bool, peer.recvDataShards)
+		for j := 0; j < totalRecvShards; j++ {
+			peer.recvBuffers[i].buffers[j] = make([]uint8, MaxMessageSize)
+		}
+		peer.recvBuffers[i].reset()
+		for j := 0; j < peer.recvDataShards; j++ {
+			peer.recvBuffers[i].delivered[j] = true
+		}
+	}
 
 	// reset endpoint
 
@@ -182,9 +265,11 @@ func (peer *Peer) Start() {
 
 	// prepare queues
 
+	peer.queue.outboundFEC = make(chan *QueueOutboundElement, QueueOutboundSize)
 	peer.queue.nonce = make(chan *QueueOutboundElement, QueueOutboundSize)
 	peer.queue.outbound = make(chan *QueueOutboundElement, QueueOutboundSize)
 	peer.queue.inbound = make(chan *QueueInboundElement, QueueInboundSize)
+	peer.queue.inboundFEC = make(chan *QueueInboundElement, QueueInboundSize)
 
 	peer.timersInit()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
@@ -193,9 +278,11 @@ func (peer *Peer) Start() {
 
 	// wait for routines to start
 
+	go peer.RoutineOutboundFEC()
 	go peer.RoutineNonce()
 	go peer.RoutineSequentialSender()
 	go peer.RoutineSequentialReceiver()
+	go peer.RoutineInboundFEC()
 
 	peer.routines.starting.Wait()
 	peer.isRunning.Set(true)
@@ -251,9 +338,11 @@ func (peer *Peer) Stop() {
 
 	// close queues
 
+	close(peer.queue.outboundFEC)
 	close(peer.queue.nonce)
 	close(peer.queue.outbound)
 	close(peer.queue.inbound)
+	close(peer.queue.inboundFEC)
 
 	peer.ZeroAndFlushAll()
 }

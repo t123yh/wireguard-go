@@ -45,6 +45,7 @@ const (
 	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
 	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake releated message
+	MessageMetadataSize        = 4
 )
 
 const (

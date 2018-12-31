@@ -257,6 +257,7 @@ func main() {
 			conn, err := uapi.Accept()
 			if err != nil {
 				errs <- err
+				logger.Error.Println("UAPI error")
 				return
 			}
 			go ipcHandle(device, conn)

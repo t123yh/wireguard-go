@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -42,13 +43,14 @@ import (
  */
 
 type QueueOutboundElement struct {
-	dropped int32
-	mutex   sync.Mutex
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	dropped          int32
+	mutex            sync.Mutex
+	buffer           *[MaxMessageSize]byte // slice holding the packet data
+	contentToEncrypt []byte                // slice of "buffer" (always!)
+	nonce            uint64                // nonce for encryption
+	keypair          *Keypair              // keypair for encryption
+	peer             *Peer                 // related peer
+	isParity         bool
 }
 
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
@@ -59,6 +61,7 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem.nonce = 0
 	elem.keypair = nil
 	elem.peer = nil
+	elem.isParity = false
 	return elem
 }
 
@@ -70,12 +73,13 @@ func (elem *QueueOutboundElement) IsDropped() bool {
 	return atomic.LoadInt32(&elem.dropped) == AtomicTrue
 }
 
-func addToNonceQueue(queue chan *QueueOutboundElement, element *QueueOutboundElement, device *Device) {
+func addToWorkQueue(queue chan *QueueOutboundElement, element *QueueOutboundElement, device *Device) {
 	for {
 		select {
 		case queue <- element:
 			return
 		default:
+			fmt.Println("Send: Dropping packet because queue is full")
 			select {
 			case old := <-queue:
 				device.PutMessageBuffer(old.buffer)
@@ -110,7 +114,7 @@ func (peer *Peer) SendKeepalive() bool {
 		return false
 	}
 	elem := peer.device.NewOutboundElement()
-	elem.packet = nil
+	elem.contentToEncrypt = nil
 	select {
 	case peer.queue.nonce <- elem:
 		peer.device.log.Debug.Println(peer, "- Sending keepalive packet")
@@ -266,7 +270,9 @@ func (device *Device) RoutineReadFromTUN() {
 		// read packet
 
 		offset := MessageTransportHeaderSize
-		size, err := device.tun.device.Read(elem.buffer[:], offset)
+		logDebug.Println("Reading from tun, buffer size is ", len(elem.buffer))
+		size, err := device.tun.device.Read(elem.buffer[:], offset+MessageMetadataSize)
+		logDebug.Println(size, " bytes read")
 
 		if err != nil {
 			if !device.isClosed.Get() {
@@ -278,28 +284,31 @@ func (device *Device) RoutineReadFromTUN() {
 			return
 		}
 
+		size += MessageMetadataSize
+
 		if size == 0 || size > MaxContentSize {
 			continue
 		}
 
-		elem.packet = elem.buffer[offset : offset+size]
+		elem.contentToEncrypt = elem.buffer[offset : offset+size]
 
 		// lookup peer
 
+		packet := elem.contentToEncrypt[MessageMetadataSize:]
 		var peer *Peer
-		switch elem.packet[0] >> 4 {
+		switch packet[0] >> 4 {
 		case ipv4.Version:
-			if len(elem.packet) < ipv4.HeaderLen {
+			if len(packet) < ipv4.HeaderLen {
 				continue
 			}
-			dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+			dst := packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
 			peer = device.allowedips.LookupIPv4(dst)
 
 		case ipv6.Version:
-			if len(elem.packet) < ipv6.HeaderLen {
+			if len(packet) < ipv6.HeaderLen {
 				continue
 			}
-			dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
+			dst := packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
 			peer = device.allowedips.LookupIPv6(dst)
 
 		default:
@@ -307,6 +316,7 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if peer == nil {
+			logDebug.Println("Nowhere to send to, skipping")
 			continue
 		}
 
@@ -316,7 +326,9 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer.queue.packetInNonceQueueIsAwaitingKey.Get() {
 				peer.SendHandshakeInitiation(false)
 			}
-			addToNonceQueue(peer.queue.nonce, elem, device)
+
+			atomic.AddUint64(&peer.stats.txPackets, 1)
+			addToWorkQueue(peer.queue.outboundFEC, elem, device)
 			elem = nil
 		}
 	}
@@ -326,6 +338,113 @@ func (peer *Peer) FlushNonceQueue() {
 	select {
 	case peer.signals.flushNonceQueue <- struct{}{}:
 	default:
+	}
+}
+
+func (peer *Peer) RoutineOutboundFEC() {
+	device := peer.device
+	logDebug := device.log.Debug
+
+	flush := func() {
+		for {
+			select {
+			case elem := <-peer.queue.outboundFEC:
+				device.PutMessageBuffer(elem.buffer)
+				device.PutOutboundElement(elem)
+			default:
+				return
+			}
+		}
+	}
+
+	defer func() {
+		flush()
+		logDebug.Println(peer, "- Routine: outbound FEC worker - stopped")
+		peer.routines.stopping.Done()
+	}()
+
+	peer.routines.starting.Done()
+	logDebug.Println(peer, "- Routine: outbound FEC worker - started")
+
+	for {
+
+		select {
+		case <-peer.routines.stop:
+			return
+
+		case elem, ok := <-peer.queue.outboundFEC:
+
+			if !ok {
+				return
+			}
+
+			// pad content to multiple of 16
+
+			mtu := int(atomic.LoadInt32(&device.tun.mtu))
+			lastUnit := len(elem.contentToEncrypt) % mtu
+			paddedSize := (lastUnit + PaddingMultiple - 1) & ^(PaddingMultiple - 1)
+			if paddedSize > mtu {
+				paddedSize = mtu
+			}
+			for i := len(elem.contentToEncrypt); i < paddedSize; i++ {
+				elem.contentToEncrypt = append(elem.contentToEncrypt, 0)
+			}
+
+			// copy packet content to fec buffer
+
+			peer.sendGroup[peer.sendGroupPos] = peer.sendGroup[peer.sendGroupPos][:len(elem.contentToEncrypt)-MessageMetadataSize] // expand buffer to desired size
+			copy(peer.sendGroup[peer.sendGroupPos][:], elem.contentToEncrypt[MessageMetadataSize:])
+
+			elem.contentToEncrypt[0] = peer.sendGroupPos
+			binary.LittleEndian.PutUint16(elem.contentToEncrypt[1:3], peer.sendGroupId)
+
+			addToWorkQueue(peer.queue.nonce, elem, device)
+
+			peer.sendGroupPos++
+
+			if peer.sendGroupPos == uint8(peer.sendDataShards) {
+				maxSize := 0
+				for i := 0; i < peer.sendDataShards; i++ {
+					// fmt.Printf("SendGroup[%d].length = %d\n", i, len(peer.sendGroup[i]))
+					if len(peer.sendGroup[i]) > maxSize {
+						maxSize = len(peer.sendGroup[i])
+					}
+				}
+
+				// resize all shards to maximum size making all shards equal in size
+
+				for i := 0; i < peer.sendDataShards+peer.sendParityShards; i++ {
+					originalLen := len(peer.sendGroup[i])
+					peer.sendGroup[i] = peer.sendGroup[i][:maxSize]
+					// pad the expanded space with 0
+					for j := originalLen; j < maxSize; j++ {
+						peer.sendGroup[i][j] = 0
+					}
+				}
+
+				err := peer.sendEncoder.Encode(peer.sendGroup)
+				if err == nil {
+					offset := MessageTransportHeaderSize
+					for i := peer.sendDataShards; i < peer.sendDataShards+peer.sendParityShards; i++ {
+						newElem := device.NewOutboundElement()
+						newElem.contentToEncrypt = newElem.buffer[offset : offset+MessageMetadataSize+maxSize]
+						newElem.isParity = true
+						copy(newElem.contentToEncrypt[MessageMetadataSize:], peer.sendGroup[i])
+						// fmt.Printf("First parity byte is %d, %d bytes copied\n", peer.sendGroup[i][0], copied)
+						newElem.contentToEncrypt[0] = uint8(i)
+						binary.LittleEndian.PutUint16(newElem.contentToEncrypt[1:3], peer.sendGroupId)
+
+						logDebug.Println(peer, " FEC: generated")
+						addToWorkQueue(peer.queue.nonce, newElem, device)
+					}
+				} else {
+					logDebug.Println(peer, "- Routing: FEC worker - error encoding: ", err)
+				}
+
+				peer.sendGroupPos = 0
+				peer.sendGroupId++
+			}
+		}
 	}
 }
 
@@ -514,25 +633,14 @@ func (device *Device) RoutineEncryption() {
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
-			// pad content to multiple of 16
-
-			mtu := int(atomic.LoadInt32(&device.tun.mtu))
-			lastUnit := len(elem.packet) % mtu
-			paddedSize := (lastUnit + PaddingMultiple - 1) & ^(PaddingMultiple - 1)
-			if paddedSize > mtu {
-				paddedSize = mtu
-			}
-			for i := len(elem.packet); i < paddedSize; i++ {
-				elem.packet = append(elem.packet, 0)
-			}
-
 			// encrypt content and release to consumer
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			elem.packet = elem.keypair.send.Seal(
+			logDebug.Printf("Length before seal: %d", len(elem.contentToEncrypt))
+			elem.contentToEncrypt = elem.keypair.send.Seal(
 				header,
 				nonce[:],
-				elem.packet,
+				elem.contentToEncrypt,
 				nil,
 			)
 			elem.mutex.Unlock()
@@ -599,8 +707,9 @@ func (peer *Peer) RoutineSequentialSender() {
 
 			// send message and return buffer to pool
 
-			length := uint64(len(elem.packet))
-			err := peer.SendBuffer(elem.packet)
+			length := uint64(len(elem.contentToEncrypt))
+
+			err := peer.SendBuffer(elem.contentToEncrypt)
 			device.PutMessageBuffer(elem.buffer)
 			device.PutOutboundElement(elem)
 			if err != nil {
@@ -609,7 +718,8 @@ func (peer *Peer) RoutineSequentialSender() {
 			}
 			atomic.AddUint64(&peer.stats.txBytes, length)
 
-			if len(elem.packet) != MessageKeepaliveSize {
+			if len(elem.contentToEncrypt) != MessageKeepaliveSize {
+				atomic.AddUint64(&peer.stats.txDelivered, 1)
 				peer.timersDataSent()
 			}
 			peer.keepKeyFreshSending()

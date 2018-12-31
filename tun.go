@@ -23,6 +23,7 @@ func (device *Device) RoutineTUNEventReader() {
 
 	for event := range device.tun.device.Events() {
 		if event&tun.TUNEventMTUUpdate != 0 {
+			logDebug.Println("Reading MTU")
 			mtu, err := device.tun.device.MTU()
 			old := atomic.LoadInt32(&device.tun.mtu)
 			if err != nil {

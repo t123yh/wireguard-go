@@ -46,3 +46,17 @@ func min(a, b uint) uint {
 	}
 	return a
 }
+
+func min64(a, b uint64) uint64 {
+	if a > b {
+		return b
+	}
+	return a
+}
+
+func max64(a, b uint64) uint64 {
+	if a < b {
+		return b
+	}
+	return a
+}

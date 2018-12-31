@@ -89,6 +89,12 @@ func ipcGetOperation(device *Device, socket *bufio.ReadWriter) *IPCError {
 			send(fmt.Sprintf("rx_bytes=%d", atomic.LoadUint64(&peer.stats.rxBytes)))
 			send(fmt.Sprintf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval))
 
+			fmt.Printf("Peer %v: txPackets=%d, txDelivered=%d, rxPackets=%d, rxDelivered=%d\n", peer, peer.stats.txPackets, peer.stats.txDelivered, peer.stats.rxPackets, peer.stats.rxDelivered)
+			atomic.StoreUint64(&peer.stats.rxDelivered, 0)
+			atomic.StoreUint64(&peer.stats.txDelivered, 0)
+			atomic.StoreUint64(&peer.stats.txPackets, 0)
+			atomic.StoreUint64(&peer.stats.rxPackets, 0)
+
 			for _, ip := range device.allowedips.EntriesForPeer(peer) {
 				send("allowed_ip=" + ip.String())
 			}
